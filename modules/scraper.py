@@ -15,6 +15,11 @@ import time
 from collections import deque
 from urllib.parse import urlparse
 
+try:
+    import resource
+except ImportError:  # non-POSIX (Windows)
+    resource = None
+
 import requests
 from tqdm import tqdm
 
@@ -486,10 +491,10 @@ def run_validation_pass(proxy_list, direct_ip, target_file, label, timeout, retr
     pending = {}
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=VALIDATE_THREADS)
-    submit_validation_batch(executor, proxy_queue, pending, direct_ip, in_flight_limit, timeout, retry_on_timeout)
 
     try:
         with open(target_file, "a") as out, tqdm(total=total, desc=label, unit="px", colour="green") as pbar:
+            submit_validation_batch(executor, proxy_queue, pending, direct_ip, in_flight_limit, timeout, retry_on_timeout)
             last_progress = time.monotonic()
 
             while pending:
@@ -639,5 +644,31 @@ def scrape_proxies():
     print(f"[+] Saved to {target_file}")
 
 
+def raise_fd_limit():
+    """
+    Validation opens up to IN_FLIGHT sockets concurrently. When launched from a
+    subprocess (e.g. the orchestrator) the inherited soft RLIMIT_NOFILE can be
+    as low as 256 on macOS, which exhausts before the output file even opens.
+    Raise the soft limit toward the hard limit so the in-flight pool fits.
+    """
+    if resource is None:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+
+    needed = VALIDATE_THREADS * IN_FLIGHT_MULTIPLIER + 256
+    target = needed if hard == resource.RLIM_INFINITY else min(needed, hard)
+    if soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        print(f"[!] Could not raise open-file limit (soft={soft}); "
+              f"validation may hit 'Too many open files'.")
+
+
 if __name__ == "__main__":
+    raise_fd_limit()
     scrape_proxies()
